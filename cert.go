@@ -223,13 +223,6 @@ func authz(ctx context.Context, client *acme.Client, domain string) error {
 		return errors.New("no supported challenge found")
 	}
 
-	// respond to http-01 challenge
-	ln, err := net.Listen("tcp", certAddr)
-	if err != nil {
-		return fmt.Errorf("listen %s: %v", certAddr, err)
-	}
-	defer ln.Close()
-
 	switch {
 	case certManual:
 		// manual challenge response
@@ -272,6 +265,13 @@ func authz(ctx context.Context, client *acme.Client, domain string) error {
 			return err
 		}
 	default:
+		// respond to http-01 challenge
+		ln, err := net.Listen("tcp", certAddr)
+		if err != nil {
+			return fmt.Errorf("listen %s: %v", certAddr, err)
+		}
+		defer ln.Close()
+
 		// auto, via local server
 		val, err := client.HTTP01ChallengeResponse(chal.Token)
 		if err != nil {
@@ -290,14 +290,16 @@ func authz(ctx context.Context, client *acme.Client, domain string) error {
 }
 
 func challengeFile(domain, content string, file string) (string, error) {
-	fileData := []byte(content)
-	tmpFilePath := "/tmp/" + filepath.Base(file)
-	err := ioutil.WriteFile(tmpFilePath, fileData, 0644)
+	dir, err := ioutil.TempDir("", "acme")
 	if err != nil {
-		return "", err
+		log.Fatal(err)
 	}
-
-	return tmpFilePath, err
+	tmpfn := filepath.Join(dir, filepath.Base(file))
+	fileData := []byte(content)
+	if err := ioutil.WriteFile(tmpfn, fileData, 0644); err != nil {
+		log.Fatal(err)
+	}
+	return tmpfn, err
 }
 
 func http01Handler(path, value string) http.Handler {
