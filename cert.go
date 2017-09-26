@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/x509"
@@ -23,8 +24,15 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awsutil"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 
 	"golang.org/x/crypto/acme"
 )
@@ -32,7 +40,7 @@ import (
 var (
 	cmdCert = &command{
 		run:       runCert,
-		UsageLine: "cert [-c config] [-d url] [-s host:port] [-k key] [-expiry dur] [-bundle=true] [-manual=false] [-dns=false] domain [domain ...]",
+		UsageLine: "cert [-c config] [-d url] [-s host:port] [-k key] [-expiry dur] [-bundle=true] [-manual=false] [-dns=false] [-s3=false] [-s3bucket=bucket] domain [domain ...]",
 		Short:     "request a new certificate",
 		Long: `
 Cert creates a new certificate for the given domain.
@@ -63,7 +71,9 @@ Default location of the config dir is
 	certBundle  = true
 	certManual  = false
 	certDNS     = false
+	certS3      = false
 	certKeypath string
+	s3bucket    string
 )
 
 func init() {
@@ -73,7 +83,50 @@ func init() {
 	cmdCert.flag.BoolVar(&certBundle, "bundle", certBundle, "")
 	cmdCert.flag.BoolVar(&certManual, "manual", certManual, "")
 	cmdCert.flag.BoolVar(&certDNS, "dns", certDNS, "")
+	cmdCert.flag.BoolVar(&certS3, "s3", certS3, "")
 	cmdCert.flag.StringVar(&certKeypath, "k", "", "")
+	cmdCert.flag.StringVar(&s3bucket, "s3bucket", s3bucket, "")
+}
+
+func s3upload(file string) (string, error) {
+	/*
+		token := ""
+		creds := credentials.NewStaticCredentials(aws_access_key_id, aws_secret_access_key, token)
+		_, err := creds.Get()
+		if err != nil {
+			fmt.Printf("bad credentials: %s", err)
+		}
+	*/
+	cfg := aws.NewConfig().WithRegion("us-east-1").WithCredentials(credentials.AnonymousCredentials)
+	svc := s3.New(session.New(), cfg)
+
+	uploadFile, err := os.Open(file)
+	if err != nil {
+		fmt.Printf("err opening file: %s", err)
+	}
+	defer uploadFile.Close()
+	fileInfo, _ := uploadFile.Stat()
+	size := fileInfo.Size()
+	buffer := make([]byte, size) // read file content to buffer
+
+	uploadFile.Read(buffer)
+	fileBytes := bytes.NewReader(buffer)
+	fileType := http.DetectContentType(buffer)
+	path := "/.well-known/acme-challenge/" + filepath.Base(uploadFile.Name())
+	fmt.Printf("file to upload: %s", path)
+	params := &s3.PutObjectInput{
+		Bucket:        aws.String(s3bucket),
+		Key:           aws.String(path),
+		Body:          fileBytes,
+		ContentLength: aws.Int64(size),
+		ContentType:   aws.String(fileType),
+	}
+	resp, err := svc.PutObject(params)
+	if err != nil {
+		fmt.Printf("bad response: %s", err)
+	}
+	fmt.Printf("response %s", awsutil.StringValue(resp))
+	return awsutil.StringValue(resp), err
 }
 
 func runCert(args []string) {
@@ -184,12 +237,13 @@ func authz(ctx context.Context, client *acme.Client, domain string) error {
 		if err != nil {
 			return err
 		}
-		file, err := challengeFile(domain, tok)
+		filename := client.HTTP01ChallengePath(chal.Token)
+		file, err := challengeFile(domain, tok, filename)
 		if err != nil {
 			return err
 		}
 		fmt.Printf("Copy %s to http://%s%s and press enter.\n",
-			file, domain, client.HTTP01ChallengePath(chal.Token))
+			file, domain, filename)
 		var x string
 		fmt.Scanln(&x)
 	case certDNS:
@@ -201,6 +255,22 @@ func authz(ctx context.Context, client *acme.Client, domain string) error {
 			domain, val)
 		var x string
 		fmt.Scanln(&x)
+	case certS3:
+		// Copy to S3 bucket which is hosting the website
+		tok, err := client.HTTP01ChallengeResponse(chal.Token)
+		if err != nil {
+			return err
+		}
+		webPath := client.HTTP01ChallengePath(chal.Token)
+		file, err := challengeFile(domain, tok, webPath)
+		if err != nil {
+			return err
+		}
+
+		_, err = s3upload(file)
+		if err != nil {
+			return err
+		}
 	default:
 		// auto, via local server
 		val, err := client.HTTP01ChallengeResponse(chal.Token)
@@ -219,16 +289,15 @@ func authz(ctx context.Context, client *acme.Client, domain string) error {
 	return err
 }
 
-func challengeFile(domain, content string) (string, error) {
-	f, err := ioutil.TempFile("", domain)
+func challengeFile(domain, content string, file string) (string, error) {
+	fileData := []byte(content)
+	tmpFilePath := "/tmp/" + filepath.Base(file)
+	err := ioutil.WriteFile(tmpFilePath, fileData, 0644)
 	if err != nil {
 		return "", err
 	}
-	_, err = fmt.Fprint(f, content)
-	if err1 := f.Close(); err1 != nil && err == nil {
-		err = err1
-	}
-	return f.Name(), err
+
+	return tmpFilePath, err
 }
 
 func http01Handler(path, value string) http.Handler {
