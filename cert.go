@@ -14,6 +14,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -25,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -72,6 +74,7 @@ Default location of the config dir is
 	certManual  = false
 	certDNS     = false
 	certS3      = false
+	certTLS     = false
 	certKeypath string
 	s3bucket    string
 )
@@ -84,6 +87,7 @@ func init() {
 	cmdCert.flag.BoolVar(&certManual, "manual", certManual, "")
 	cmdCert.flag.BoolVar(&certDNS, "dns", certDNS, "")
 	cmdCert.flag.BoolVar(&certS3, "s3", certS3, "")
+	cmdCert.flag.BoolVar(&certTLS, "tls", certTLS, "")
 	cmdCert.flag.StringVar(&certKeypath, "k", "", "")
 	cmdCert.flag.StringVar(&s3bucket, "s3bucket", s3bucket, "")
 }
@@ -214,7 +218,8 @@ func authz(ctx context.Context, client *acme.Client, domain string) error {
 	}
 	var chal *acme.Challenge
 	for _, c := range z.Challenges {
-		if (c.Type == "http-01" && !certDNS) || (c.Type == "dns-01" && certDNS) {
+		fmt.Printf("Challenge is: %s\n", c.Type)
+		if (c.Type == "http-01" && !certDNS && !certTLS) || (c.Type == "dns-01" && certDNS) || (c.Type == "tls-sni-01" && certTLS) {
 			chal = c
 			break
 		}
@@ -263,6 +268,30 @@ func authz(ctx context.Context, client *acme.Client, domain string) error {
 		_, err = s3upload(file)
 		if err != nil {
 			return err
+		}
+	case certTLS:
+		// TLS-SNI-01 challenge as Let's Encrypt doesn't support yet - 05-10-2017 TLS-SNI-02
+		cert, certDNSNameA, err := client.TLSSNI01ChallengeCert(chal.Token)
+		if err != nil {
+			return fmt.Errorf("TLS-SNI-01 auth failed: %s", err)
+		}
+		certKey := cert.PrivateKey
+		pk := certKey.(*ecdsa.PrivateKey)
+		err = writeKey(configDir+"lets-encrypt-self-sign.key", pk)
+		if err != nil {
+			return fmt.Errorf("Unable to to write private key file")
+		}
+		var pemcert []byte
+		for _, b := range cert.Certificate {
+			b = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: b})
+			pemcert = append(pemcert, b...)
+		}
+		ioutil.WriteFile(configDir+"lets-encrypt-self-sign.crt", pemcert, 0644)
+		fmt.Printf("Certificate CommonName is: %s\n", certDNSNameA)
+		cmd := exec.Command("service", "nginx", "restart")
+		err = cmd.Run()
+		if err != nil {
+			log.Fatal(err)
 		}
 	default:
 		// respond to http-01 challenge
