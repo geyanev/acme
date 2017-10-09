@@ -18,7 +18,6 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -42,7 +41,7 @@ import (
 var (
 	cmdCert = &command{
 		run:       runCert,
-		UsageLine: "cert [-c config] [-d url] [-s host:port] [-k key] [-expiry dur] [-bundle=true] [-manual=false] [-dns=false] [-s3=false] [-s3bucket=bucket] domain [domain ...]",
+		UsageLine: "cert [-c config] [-d url] [-s host:port] [-k key] [-expiry dur] [-bundle=true] [-manual=false] [-dns=false] [-s3=false] [-tls=false] [-s3bucket=bucket] domain [domain ...]",
 		Short:     "request a new certificate",
 		Long: `
 Cert creates a new certificate for the given domain.
@@ -197,14 +196,11 @@ func runCert(args []string) {
 		fatalf("cert: %v", err)
 	}
 	logf("cert url: %s", curl)
-	var pemcert []byte
-	for _, b := range cert {
-		b = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: b})
-		pemcert = append(pemcert, b...)
-	}
+
 	certPath := sameDir(certKeypath, cn+".crt")
-	if err := ioutil.WriteFile(certPath, pemcert, 0644); err != nil {
-		fatalf("write cert: %v", err)
+	err = writeCert(certPath, cert)
+	if err != nil {
+		return fmt.Errorf("Unable to to write certificate key file")
 	}
 }
 
@@ -281,12 +277,12 @@ func authz(ctx context.Context, client *acme.Client, domain string) error {
 		if err != nil {
 			return fmt.Errorf("Unable to to write private key file")
 		}
-		var pemcert []byte
-		for _, b := range cert.Certificate {
-			b = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: b})
-			pemcert = append(pemcert, b...)
+
+		err = writeCert(configDir+"lets-encrypt-self-sign.crt", cert.Certificate)
+		if err != nil {
+			return fmt.Errorf("Unable to to write certificate key file")
 		}
-		ioutil.WriteFile(configDir+"lets-encrypt-self-sign.crt", pemcert, 0644)
+
 		fmt.Printf("Certificate CommonName is: %s\n", certDNSNameA)
 		cmd := exec.Command("service", "nginx", "restart")
 		err = cmd.Run()
