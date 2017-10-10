@@ -200,7 +200,7 @@ func runCert(args []string) {
 	certPath := sameDir(certKeypath, cn+".crt")
 	err = writeCert(certPath, cert)
 	if err != nil {
-		return fmt.Errorf("Unable to to write certificate key file")
+		fatalf("write cert: %v", err)
 	}
 }
 
@@ -275,12 +275,12 @@ func authz(ctx context.Context, client *acme.Client, domain string) error {
 		pk := certKey.(*ecdsa.PrivateKey)
 		err = writeKey(configDir+"lets-encrypt-self-sign.key", pk)
 		if err != nil {
-			return fmt.Errorf("Unable to to write private key file")
+			return fmt.Errorf("Unable to to write private key file %v", err)
 		}
 
 		err = writeCert(configDir+"lets-encrypt-self-sign.crt", cert.Certificate)
 		if err != nil {
-			return fmt.Errorf("Unable to to write certificate key file")
+			return fmt.Errorf("Unable to to write certificate key file %v", err)
 		}
 
 		fmt.Printf("Certificate CommonName is: %s\n", certDNSNameA)
