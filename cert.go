@@ -196,7 +196,7 @@ func runCert(args []string) {
 	}
 	for _, domain := range args {
 		ctx, cancel := context.Background(), func() {}
-		if !certManual && !certDNS {
+		if !certManual {
 			ctx, cancel = context.WithTimeout(context.Background(), 10*time.Minute)
 		}
 		if err := authz(ctx, client, domain); err != nil {
@@ -270,7 +270,7 @@ func authz(ctx context.Context, client *acme.Client, domain string) error {
 		svc := route53.New(session.New())
 		if len(awsAssumeRole) > 0 {
 			sess := session.Must(session.NewSession())
-			creds := stscreds.NewCredentials(sess, "arn:aws:iam::421781391232:role/Route53TelerikRocksPublicChangeRecordSets")
+			creds := stscreds.NewCredentials(sess, awsAssumeRole)
 			svc = route53.New(sess, &aws.Config{Credentials: creds})
 		}
 
@@ -301,7 +301,7 @@ func authz(ctx context.Context, client *acme.Client, domain string) error {
 		for i := 0; i <= 120; i++ {
 			result, err := svc.GetChange(getRoute53RequestStatus)
 			if err != nil {
-				fmt.Println("Failed to query Route53 for the DNS change")
+				return fmt.Errorf("Failed to query Route53 for the DNS change: %v", err)
 			}
 
 			if *result.ChangeInfo.Status == route53.ChangeStatusInsync {
