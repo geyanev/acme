@@ -32,7 +32,9 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awsutil"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/route53"
 	"github.com/aws/aws-sdk-go/service/s3"
 
 	"golang.org/x/crypto/acme"
@@ -41,7 +43,7 @@ import (
 var (
 	cmdCert = &command{
 		run:       runCert,
-		UsageLine: "cert [-c config] [-d url] [-s host:port] [-k key] [-expiry dur] [-bundle=true] [-manual=false] [-dns=false] [-s3=false] [-tls=false] [-s3bucket=bucket] domain [domain ...]",
+		UsageLine: "cert [-c config] [-d url] [-s host:port] [-k key] [-expiry dur] [-bundle=true] [-aws-assume-role role] [-manual=false] [-dns=false] [-dns-route53-zoneid zoneid] [-s3=false] [-tls=false] [-s3bucket=bucket] domain [domain ...]",
 		Short:     "request a new certificate",
 		Long: `
 Cert creates a new certificate for the given domain.
@@ -66,16 +68,18 @@ Default location of the config dir is
 		`,
 	}
 
-	certDisco   = defaultDiscoFlag
-	certAddr    = "127.0.0.1:8080"
-	certExpiry  = 365 * 12 * time.Hour
-	certBundle  = true
-	certManual  = false
-	certDNS     = false
-	certS3      = false
-	certTLS     = false
-	certKeypath string
-	s3bucket    string
+	certDisco     = defaultDiscoFlag
+	certAddr      = "127.0.0.1:8080"
+	certExpiry    = 365 * 12 * time.Hour
+	certBundle    = true
+	certManual    = false
+	certDNS       = false
+	certS3        = false
+	certTLS       = false
+	certKeypath   string
+	s3bucket      string
+	route53ZoneID string
+	awsAssumeRole string
 )
 
 func init() {
@@ -89,6 +93,20 @@ func init() {
 	cmdCert.flag.BoolVar(&certTLS, "tls", certTLS, "")
 	cmdCert.flag.StringVar(&certKeypath, "k", "", "")
 	cmdCert.flag.StringVar(&s3bucket, "s3bucket", s3bucket, "")
+	cmdCert.flag.StringVar(&route53ZoneID, "dns-route53-zoneid", route53ZoneID, "")
+	cmdCert.flag.StringVar(&awsAssumeRole, "aws-assume-role", awsAssumeRole, "")
+}
+
+func newTXTRecordSet(fqdn, value string, ttl int) *route53.ResourceRecordSet {
+	value = `"` + value + `"`
+	return &route53.ResourceRecordSet{
+		Name: aws.String(fqdn),
+		Type: aws.String("TXT"),
+		TTL:  aws.Int64(int64(ttl)),
+		ResourceRecords: []*route53.ResourceRecord{
+			{Value: aws.String(value)},
+		},
+	}
 }
 
 func s3upload(file string) (string, error) {
@@ -214,12 +232,12 @@ func authz(ctx context.Context, client *acme.Client, domain string) error {
 	}
 	var chal *acme.Challenge
 	for _, c := range z.Challenges {
-		fmt.Printf("Challenge is: %s\n", c.Type)
 		if (c.Type == "http-01" && !certDNS && !certTLS) || (c.Type == "dns-01" && certDNS) || (c.Type == "tls-sni-01" && certTLS) {
 			chal = c
 			break
 		}
 	}
+	fmt.Printf("Challenge is: %s\n", chal.Type)
 	if chal == nil {
 		return errors.New("no supported challenge found")
 	}
@@ -241,14 +259,61 @@ func authz(ctx context.Context, client *acme.Client, domain string) error {
 		var x string
 		fmt.Scanln(&x)
 	case certDNS:
+		if len(route53ZoneID) == 0 {
+			return fmt.Errorf("Required parameter missing: -dns-route53-zoneid")
+		}
 		val, err := client.DNS01ChallengeRecord(chal.Token)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("Add a TXT record for _acme-challenge.%s with the value %q and press enter after it has propagated.\n",
-			domain, val)
-		var x string
-		fmt.Scanln(&x)
+
+		svc := route53.New(session.New())
+		if len(awsAssumeRole) > 0 {
+			sess := session.Must(session.NewSession())
+			creds := stscreds.NewCredentials(sess, "arn:aws:iam::421781391232:role/Route53TelerikRocksPublicChangeRecordSets")
+			svc = route53.New(sess, &aws.Config{Credentials: creds})
+		}
+
+		domain = "_acme-challenge." + domain
+		recordSet := newTXTRecordSet(domain, val, 60)
+		reqParams := &route53.ChangeResourceRecordSetsInput{
+			HostedZoneId: aws.String(route53ZoneID),
+			ChangeBatch: &route53.ChangeBatch{
+				Comment: aws.String("Managed by ACME client"),
+				Changes: []*route53.Change{
+					{
+						Action:            aws.String("UPSERT"),
+						ResourceRecordSet: recordSet,
+					},
+				},
+			},
+		}
+		resp, err := svc.ChangeResourceRecordSets(reqParams)
+		if err != nil {
+			return fmt.Errorf("Failed to change Route53 record set: %v", err)
+		}
+		statusID := resp.ChangeInfo.Id
+		fmt.Printf("Wait for Route53 DNS service to apply TXT record: %v, value: %v\n", *recordSet.Name, recordSet.ResourceRecords)
+		getRoute53RequestStatus := &route53.GetChangeInput{
+			Id: statusID,
+		}
+		success := false
+		for i := 0; i <= 120; i++ {
+			result, err := svc.GetChange(getRoute53RequestStatus)
+			if err != nil {
+				fmt.Println("Failed to query Route53 for the DNS change")
+			}
+
+			if *result.ChangeInfo.Status == route53.ChangeStatusInsync {
+				fmt.Println("Route53 DNS change applied")
+				success = true
+				break
+			}
+			time.Sleep(1 * time.Second)
+		}
+		if !success {
+			return fmt.Errorf("Route53 did not set the record in time")
+		}
 	case certS3:
 		// Copy to S3 bucket which is hosting the website
 		tok, err := client.HTTP01ChallengeResponse(chal.Token)
