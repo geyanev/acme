@@ -125,6 +125,14 @@ func readKey(path string) (crypto.Signer, error) {
 // writeKey writes k to the specified path in PEM format.
 // If file does not exists, it will be created with 0600 mod.
 func writeKey(path string, k *ecdsa.PrivateKey) error {
+	if _, err := os.Stat(configDir); os.IsNotExist(err) {
+		err = os.MkdirAll(configDir, 0755)
+
+		if err != nil {
+			return err
+		}
+	}
+
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
@@ -157,6 +165,20 @@ func anyKey(filename string, gen bool) (crypto.Signer, error) {
 		return nil, err
 	}
 	return ecKey, writeKey(filename, ecKey)
+}
+
+func writeCert(filename string, der [][]byte) error {
+	var pemcert []byte
+	for _, b := range der {
+		b = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: b})
+		pemcert = append(pemcert, b...)
+	}
+
+	err := ioutil.WriteFile(filename, pemcert, 0644)
+	if err != nil {
+		errorf("write cert: %v", err)
+	}
+	return err
 }
 
 // sameDir returns filename path placing it in the same dir as existing file.

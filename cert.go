@@ -12,19 +12,30 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awsutil"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/route53"
+	"github.com/aws/aws-sdk-go/service/s3"
 
 	"golang.org/x/crypto/acme"
 )
@@ -32,7 +43,7 @@ import (
 var (
 	cmdCert = &command{
 		run:       runCert,
-		UsageLine: "cert [-c config] [-d url] [-s host:port] [-k key] [-expiry dur] [-bundle=true] [-manual=false] [-dns=false] domain [domain ...]",
+		UsageLine: "cert [-c config] [-d url] [-s host:port] [-k key] [-expiry dur] [-bundle=true] [-aws-assume-role role] [-manual=false] [-dns=false] [-dns-route53-zoneid zoneid] [-s3=false] [-tls=false] [-s3bucket=bucket] domain [domain ...]",
 		Short:     "request a new certificate",
 		Long: `
 Cert creates a new certificate for the given domain.
@@ -57,13 +68,18 @@ Default location of the config dir is
 		`,
 	}
 
-	certDisco   = defaultDiscoFlag
-	certAddr    = "127.0.0.1:8080"
-	certExpiry  = 365 * 12 * time.Hour
-	certBundle  = true
-	certManual  = false
-	certDNS     = false
-	certKeypath string
+	certDisco     = defaultDiscoFlag
+	certAddr      = "127.0.0.1:8080"
+	certExpiry    = 365 * 12 * time.Hour
+	certBundle    = true
+	certManual    = false
+	certDNS       = false
+	certS3        = false
+	certTLS       = false
+	certKeypath   string
+	s3bucket      string
+	route53ZoneID string
+	awsAssumeRole string
 )
 
 func init() {
@@ -73,7 +89,65 @@ func init() {
 	cmdCert.flag.BoolVar(&certBundle, "bundle", certBundle, "")
 	cmdCert.flag.BoolVar(&certManual, "manual", certManual, "")
 	cmdCert.flag.BoolVar(&certDNS, "dns", certDNS, "")
+	cmdCert.flag.BoolVar(&certS3, "s3", certS3, "")
+	cmdCert.flag.BoolVar(&certTLS, "tls", certTLS, "")
 	cmdCert.flag.StringVar(&certKeypath, "k", "", "")
+	cmdCert.flag.StringVar(&s3bucket, "s3bucket", s3bucket, "")
+	cmdCert.flag.StringVar(&route53ZoneID, "dns-route53-zoneid", route53ZoneID, "")
+	cmdCert.flag.StringVar(&awsAssumeRole, "aws-assume-role", awsAssumeRole, "")
+}
+
+func newTXTRecordSet(fqdn, value string, ttl int) *route53.ResourceRecordSet {
+	value = `"` + value + `"`
+	return &route53.ResourceRecordSet{
+		Name: aws.String(fqdn),
+		Type: aws.String("TXT"),
+		TTL:  aws.Int64(int64(ttl)),
+		ResourceRecords: []*route53.ResourceRecord{
+			{Value: aws.String(value)},
+		},
+	}
+}
+
+func s3upload(file string) (string, error) {
+	/*
+		token := ""
+		creds := credentials.NewStaticCredentials(aws_access_key_id, aws_secret_access_key, token)
+		_, err := creds.Get()
+		if err != nil {
+			fmt.Printf("bad credentials: %s", err)
+		}
+	*/
+	cfg := aws.NewConfig().WithRegion("us-east-1").WithCredentials(credentials.AnonymousCredentials)
+	svc := s3.New(session.New(), cfg)
+
+	uploadFile, err := os.Open(file)
+	if err != nil {
+		fmt.Printf("err opening file: %s", err)
+	}
+	defer uploadFile.Close()
+	fileInfo, _ := uploadFile.Stat()
+	size := fileInfo.Size()
+	buffer := make([]byte, size) // read file content to buffer
+
+	uploadFile.Read(buffer)
+	fileBytes := bytes.NewReader(buffer)
+	fileType := http.DetectContentType(buffer)
+	path := "/.well-known/acme-challenge/" + filepath.Base(uploadFile.Name())
+	fmt.Printf("file to upload: %s", path)
+	params := &s3.PutObjectInput{
+		Bucket:        aws.String(s3bucket),
+		Key:           aws.String(path),
+		Body:          fileBytes,
+		ContentLength: aws.Int64(size),
+		ContentType:   aws.String(fileType),
+	}
+	resp, err := svc.PutObject(params)
+	if err != nil {
+		fmt.Printf("bad response: %s", err)
+	}
+	fmt.Printf("response %s", awsutil.StringValue(resp))
+	return awsutil.StringValue(resp), err
 }
 
 func runCert(args []string) {
@@ -122,7 +196,7 @@ func runCert(args []string) {
 	}
 	for _, domain := range args {
 		ctx, cancel := context.Background(), func() {}
-		if !certManual && !certDNS {
+		if !certManual {
 			ctx, cancel = context.WithTimeout(context.Background(), 10*time.Minute)
 		}
 		if err := authz(ctx, client, domain); err != nil {
@@ -140,13 +214,10 @@ func runCert(args []string) {
 		fatalf("cert: %v", err)
 	}
 	logf("cert url: %s", curl)
-	var pemcert []byte
-	for _, b := range cert {
-		b = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: b})
-		pemcert = append(pemcert, b...)
-	}
+
 	certPath := sameDir(certKeypath, cn+".crt")
-	if err := ioutil.WriteFile(certPath, pemcert, 0644); err != nil {
+	err = writeCert(certPath, cert)
+	if err != nil {
 		fatalf("write cert: %v", err)
 	}
 }
@@ -161,21 +232,15 @@ func authz(ctx context.Context, client *acme.Client, domain string) error {
 	}
 	var chal *acme.Challenge
 	for _, c := range z.Challenges {
-		if (c.Type == "http-01" && !certDNS) || (c.Type == "dns-01" && certDNS) {
+		if (c.Type == "http-01" && !certDNS && !certTLS) || (c.Type == "dns-01" && certDNS) || (c.Type == "tls-sni-01" && certTLS) {
 			chal = c
 			break
 		}
 	}
+	fmt.Printf("Challenge is: %s\n", chal.Type)
 	if chal == nil {
 		return errors.New("no supported challenge found")
 	}
-
-	// respond to http-01 challenge
-	ln, err := net.Listen("tcp", certAddr)
-	if err != nil {
-		return fmt.Errorf("listen %s: %v", certAddr, err)
-	}
-	defer ln.Close()
 
 	switch {
 	case certManual:
@@ -184,24 +249,119 @@ func authz(ctx context.Context, client *acme.Client, domain string) error {
 		if err != nil {
 			return err
 		}
-		file, err := challengeFile(domain, tok)
+		filename := client.HTTP01ChallengePath(chal.Token)
+		file, err := challengeFile(domain, tok, filename)
 		if err != nil {
 			return err
 		}
 		fmt.Printf("Copy %s to http://%s%s and press enter.\n",
-			file, domain, client.HTTP01ChallengePath(chal.Token))
+			file, domain, filename)
 		var x string
 		fmt.Scanln(&x)
 	case certDNS:
+		if len(route53ZoneID) == 0 {
+			return fmt.Errorf("Required parameter missing: -dns-route53-zoneid")
+		}
 		val, err := client.DNS01ChallengeRecord(chal.Token)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("Add a TXT record for _acme-challenge.%s with the value %q and press enter after it has propagated.\n",
-			domain, val)
-		var x string
-		fmt.Scanln(&x)
+
+		svc := route53.New(session.New())
+		if len(awsAssumeRole) > 0 {
+			sess := session.Must(session.NewSession())
+			creds := stscreds.NewCredentials(sess, awsAssumeRole)
+			svc = route53.New(sess, &aws.Config{Credentials: creds})
+		}
+
+		domain = "_acme-challenge." + domain
+		recordSet := newTXTRecordSet(domain, val, 60)
+		reqParams := &route53.ChangeResourceRecordSetsInput{
+			HostedZoneId: aws.String(route53ZoneID),
+			ChangeBatch: &route53.ChangeBatch{
+				Comment: aws.String("Managed by ACME client"),
+				Changes: []*route53.Change{
+					{
+						Action:            aws.String("UPSERT"),
+						ResourceRecordSet: recordSet,
+					},
+				},
+			},
+		}
+		resp, err := svc.ChangeResourceRecordSets(reqParams)
+		if err != nil {
+			return fmt.Errorf("Failed to change Route53 record set: %v", err)
+		}
+		statusID := resp.ChangeInfo.Id
+		fmt.Printf("Wait for Route53 DNS service to apply TXT record: %v, value: %v\n", *recordSet.Name, recordSet.ResourceRecords)
+		getRoute53RequestStatus := &route53.GetChangeInput{
+			Id: statusID,
+		}
+		success := false
+		for i := 0; i <= 120; i++ {
+			result, err := svc.GetChange(getRoute53RequestStatus)
+			if err != nil {
+				return fmt.Errorf("Failed to query Route53 for the DNS change: %v", err)
+			}
+
+			if *result.ChangeInfo.Status == route53.ChangeStatusInsync {
+				fmt.Println("Route53 DNS change applied")
+				success = true
+				break
+			}
+			time.Sleep(1 * time.Second)
+		}
+		if !success {
+			return fmt.Errorf("Route53 did not set the record in time")
+		}
+	case certS3:
+		// Copy to S3 bucket which is hosting the website
+		tok, err := client.HTTP01ChallengeResponse(chal.Token)
+		if err != nil {
+			return err
+		}
+		webPath := client.HTTP01ChallengePath(chal.Token)
+		file, err := challengeFile(domain, tok, webPath)
+		if err != nil {
+			return err
+		}
+
+		_, err = s3upload(file)
+		if err != nil {
+			return err
+		}
+	case certTLS:
+		// TLS-SNI-01 challenge as Let's Encrypt doesn't support yet - 05-10-2017 TLS-SNI-02
+		cert, certDNSNameA, err := client.TLSSNI01ChallengeCert(chal.Token)
+		if err != nil {
+			return fmt.Errorf("TLS-SNI-01 auth failed: %s", err)
+		}
+		certKey := cert.PrivateKey
+		pk := certKey.(*ecdsa.PrivateKey)
+		err = writeKey(configDir+"lets-encrypt-self-sign.key", pk)
+		if err != nil {
+			return fmt.Errorf("Unable to to write private key file %v", err)
+		}
+
+		err = writeCert(configDir+"lets-encrypt-self-sign.crt", cert.Certificate)
+		if err != nil {
+			return fmt.Errorf("Unable to to write certificate key file %v", err)
+		}
+
+		fmt.Printf("Certificate CommonName is: %s\n", certDNSNameA)
+		cmd := exec.Command("service", "nginx", "restart")
+		err = cmd.Run()
+		if err != nil {
+			log.Fatal(err)
+		}
 	default:
+		// respond to http-01 challenge
+		ln, err := net.Listen("tcp", certAddr)
+		if err != nil {
+			return fmt.Errorf("listen %s: %v", certAddr, err)
+		}
+		defer ln.Close()
+
 		// auto, via local server
 		val, err := client.HTTP01ChallengeResponse(chal.Token)
 		if err != nil {
@@ -219,16 +379,17 @@ func authz(ctx context.Context, client *acme.Client, domain string) error {
 	return err
 }
 
-func challengeFile(domain, content string) (string, error) {
-	f, err := ioutil.TempFile("", domain)
+func challengeFile(domain, content string, file string) (string, error) {
+	dir, err := ioutil.TempDir("", "acme")
 	if err != nil {
-		return "", err
+		log.Fatal(err)
 	}
-	_, err = fmt.Fprint(f, content)
-	if err1 := f.Close(); err1 != nil && err == nil {
-		err = err1
+	tmpfn := filepath.Join(dir, filepath.Base(file))
+	fileData := []byte(content)
+	if err := ioutil.WriteFile(tmpfn, fileData, 0644); err != nil {
+		log.Fatal(err)
 	}
-	return f.Name(), err
+	return tmpfn, err
 }
 
 func http01Handler(path, value string) http.Handler {
